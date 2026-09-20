@@ -1,8 +1,15 @@
 import { createServer } from 'http';
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
 import { WebSocketServer, WebSocket } from 'ws';
 
 const PORT = process.env.PORT || 5174;
 const clients = new Set();
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const DATA_DIR = join(__dirname, '..', 'data');
+const DATA_FILE = join(DATA_DIR, 'store.json');
 
 /** @type {Map<string, { name: string; avatar?: string; bio?: string; id?: string }>} */
 const registeredAccounts = new Map();
@@ -12,6 +19,41 @@ let savedChannels = [];
 let savedMessages = [];
 /** @type {string|null} */
 let currentAnnouncement = null;
+
+function loadStore() {
+  try {
+    if (!existsSync(DATA_FILE)) return;
+    const raw = readFileSync(DATA_FILE, 'utf-8');
+    const data = JSON.parse(raw);
+    savedChannels = data.channels || [];
+    savedMessages = data.messages || [];
+    currentAnnouncement = data.announcement ?? null;
+    if (data.accounts?.length) {
+      for (const acc of data.accounts) upsertAccount(acc);
+    }
+    console.log(`[RévisEdu Realtime] Loaded ${savedMessages.length} messages from disk`);
+  } catch (err) {
+    console.error('[RévisEdu Realtime] Failed to load store:', err);
+  }
+}
+
+function persistStore() {
+  try {
+    if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+    writeFileSync(
+      DATA_FILE,
+      JSON.stringify({
+        accounts: getAccountsList(),
+        channels: savedChannels,
+        messages: savedMessages,
+        announcement: currentAnnouncement
+      }),
+      'utf-8'
+    );
+  } catch (err) {
+    console.error('[RévisEdu Realtime] Failed to persist store:', err);
+  }
+}
 
 function upsertAccount(profile) {
   if (!profile?.name) return;
@@ -27,6 +69,8 @@ function upsertAccount(profile) {
 function getAccountsList() {
   return Array.from(registeredAccounts.values());
 }
+
+loadStore();
 
 const httpServer = createServer((req, res) => {
   if (req.url === '/health' || req.url === '/') {
@@ -71,27 +115,56 @@ wss.on('connection', (ws, req) => {
   ws.on('message', (messageRaw) => {
     try {
       const payload = JSON.parse(messageRaw.toString());
+      let shouldPersist = false;
 
       if (payload.type === 'MESSAGE_SENT' && payload.data) {
-        savedMessages.push(payload.data);
-        if (savedMessages.length > 500) savedMessages.shift();
+        if (!savedMessages.some((m) => m.id === payload.data.id)) {
+          savedMessages.push(payload.data);
+          if (savedMessages.length > 2000) savedMessages.shift();
+          shouldPersist = true;
+        }
+      }
+
+      if (payload.type === 'MESSAGE_DELETED' && payload.data?.messageId) {
+        savedMessages = savedMessages.filter((m) => m.id !== payload.data.messageId);
+        shouldPersist = true;
+      }
+
+      if (payload.type === 'MESSAGES_CLEAR_ALL') {
+        savedMessages = [];
+        shouldPersist = true;
       }
 
       if (payload.type === 'CHANNEL_CREATED' && payload.data) {
-        savedChannels.push(payload.data);
+        if (!savedChannels.some((c) => c.id === payload.data.id)) {
+          savedChannels.push(payload.data);
+          shouldPersist = true;
+        }
+      }
+
+      if (payload.type === 'CHANNEL_DELETED' && payload.data?.channelId) {
+        savedChannels = savedChannels.filter((c) => c.id !== payload.data.channelId);
+        savedMessages = savedMessages.filter((m) => m.channelId !== payload.data.channelId);
+        shouldPersist = true;
       }
 
       if (payload.type === 'PROFILE_UPDATED' && payload.data?.profile) {
         upsertAccount(payload.data.profile);
+        shouldPersist = true;
       }
 
       if (payload.type === 'PRESENCE_PING' && payload.data?.profile) {
         upsertAccount(payload.data.profile);
+        shouldPersist = true;
       }
 
-      if (payload.type === 'ADMIN_ANNOUNCEMENT' && payload.data?.text) {
-        currentAnnouncement = payload.data.text;
+      if (payload.type === 'ADMIN_ANNOUNCEMENT') {
+        const text = payload.data?.text?.trim();
+        currentAnnouncement = text || null;
+        shouldPersist = true;
       }
+
+      if (shouldPersist) persistStore();
 
       for (const client of clients) {
         if (client !== ws && client.readyState === WebSocket.OPEN) {
@@ -116,6 +189,7 @@ wss.on('connection', (ws, req) => {
 
 process.on('SIGTERM', () => {
   console.log('[RévisEdu Realtime] Shutting down...');
+  persistStore();
   for (const client of clients) {
     if (client.readyState === WebSocket.OPEN) client.close();
   }
