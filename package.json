@@ -1,0 +1,17 @@
+{
+  "name": "revisedu-realtime-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "WebSocket realtime server for RévisEdu classroom",
+  "scripts": {
+    "start": "node server/realtimeServer.js",
+    "dev": "node server/realtimeServer.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.21.3"
+  }
+}
