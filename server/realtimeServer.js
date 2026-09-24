@@ -1,5 +1,7 @@
 import { createServer } from 'http';
-import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync } from 'fs';
+import { request as httpsRequest } from 'https';
+import { request as httpRequest } from 'http';
+import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, copyFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -13,14 +15,18 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 const PORT = Number(process.env.PORT) || 5174;
+const SERVER_START_TIME = Date.now();
+const RENDER_SERVICE_URL = process.env.RENDER_EXTERNAL_URL || 'https://revisedu.onrender.com';
+
 const clients = new Set();
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = join(__dirname, '..', 'data');
 const DATA_FILE = join(DATA_DIR, 'store.json');
 const DATA_TMP_FILE = join(DATA_DIR, 'store.json.tmp');
+const DATA_BACKUP_FILE = join(DATA_DIR, 'store.backup.json');
 
-/** @type {Map<string, { name: string; avatar?: string; bio?: string; id?: string }>} */
+/** @type {Map<string, { name: string; avatar?: string; bio?: string; id?: string; status?: string; lastSeen?: number }>} */
 const registeredAccounts = new Map();
 /** @type {Array<object>} */
 let savedChannels = [];
@@ -35,9 +41,17 @@ let savedLeaderboard = [];
 /** @type {string|null} */
 let currentAnnouncement = null;
 
+// Initial Load
 function loadStore() {
   try {
-    if (!existsSync(DATA_FILE)) return;
+    if (!existsSync(DATA_FILE)) {
+      if (existsSync(DATA_BACKUP_FILE)) {
+        console.log('[RévisEdu Realtime] Restoring from backup file...');
+        copyFileSync(DATA_BACKUP_FILE, DATA_FILE);
+      } else {
+        return;
+      }
+    }
     const raw = readFileSync(DATA_FILE, 'utf-8');
     const data = JSON.parse(raw);
     savedChannels = Array.isArray(data.channels) ? data.channels : [];
@@ -58,8 +72,23 @@ function loadStore() {
   }
 }
 
-// Atomic file write to completely eliminate file corruption
-function persistStore() {
+// High Performance Debounced Store Persistence
+let persistTimeout = null;
+let isDirty = false;
+
+function schedulePersistStore() {
+  isDirty = true;
+  if (!persistTimeout) {
+    persistTimeout = setTimeout(() => {
+      persistTimeout = null;
+      flushStoreSync();
+    }, 1000); // Batch writes every 1 second max
+  }
+}
+
+function flushStoreSync() {
+  if (!isDirty) return;
+  isDirty = false;
   try {
     if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
     const content = JSON.stringify(
@@ -79,6 +108,11 @@ function persistStore() {
 
     writeFileSync(DATA_TMP_FILE, content, 'utf-8');
     renameSync(DATA_TMP_FILE, DATA_FILE);
+
+    // Save a backup occasionally
+    try {
+      copyFileSync(DATA_FILE, DATA_BACKUP_FILE);
+    } catch {}
   } catch (err) {
     console.error('[RévisEdu Realtime] Failed to atomically persist store:', err);
   }
@@ -117,7 +151,7 @@ function getCurrentState() {
   };
 }
 
-// Robust broadcast that isolates socket errors
+// Safe broadcast to peers
 function broadcastToPeers(senderWs, payloadString) {
   for (const client of clients) {
     if (client !== senderWs && client.readyState === WebSocket.OPEN) {
@@ -134,8 +168,11 @@ function broadcastToPeers(senderWs, payloadString) {
   }
 }
 
+// -------------------------------------------------------------
+// HTTP Server: Health, Keep-Alive, Rest Sync, and Status Dashboard
+// -------------------------------------------------------------
 const httpServer = createServer((req, res) => {
-  // CORS Headers for all requests
+  // CORS Headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -148,13 +185,15 @@ const httpServer = createServer((req, res) => {
 
   const url = req.url?.split('?')[0] || '';
 
-  if (url === '/health' || url === '/' || url === '/api/keepalive') {
+  // 1. Healthcheck / Ping endpoint
+  if (url === '/health' || url === '/ping' || url === '/api/keepalive') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(
       JSON.stringify({
         status: 'ok',
         service: 'revisedu-realtime',
-        version: '2.5.0',
+        version: '3.0.0',
+        uptimeSeconds: Math.floor((Date.now() - SERVER_START_TIME) / 1000),
         peers: clients.size,
         messages: savedMessages.length,
         directMessages: savedDirectMessages.length,
@@ -166,7 +205,88 @@ const httpServer = createServer((req, res) => {
     return;
   }
 
-  // REST fallback for initial sync or when WebSockets are blocked
+  // 2. HTML Live Status Dashboard
+  if (url === '/' || url === '/status') {
+    const uptimeSec = Math.floor((Date.now() - SERVER_START_TIME) / 1000);
+    const hours = Math.floor(uptimeSec / 3600);
+    const mins = Math.floor((uptimeSec % 3600) / 60);
+    const secs = uptimeSec % 60;
+    const memUsage = Math.round(process.memoryUsage().rss / 1024 / 1024);
+
+    const onlinePeers = Array.from(clients)
+      .map((c) => c.userProfile?.name || 'Visiteur')
+      .slice(0, 20);
+
+    const html = `<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Serveur RévisEdu Temps Réel</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+    body { background: #0f172a; color: #f8fafc; padding: 24px; display: flex; justify-content: center; }
+    .container { max-width: 800px; width: 100%; }
+    .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid #1e293b; }
+    .title { font-size: 24px; font-weight: 700; color: #38bdf8; display: flex; align-items: center; gap: 10px; }
+    .badge-live { background: #10b981; color: #022c22; font-size: 12px; font-weight: 800; padding: 4px 10px; border-radius: 9999px; text-transform: uppercase; animation: pulse 2s infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
+    .card { background: #1e293b; border-radius: 12px; padding: 20px; border: 1px solid #334155; }
+    .card-label { font-size: 13px; color: #94a3b8; font-weight: 500; text-transform: uppercase; }
+    .card-value { font-size: 28px; font-weight: 800; margin-top: 8px; color: #f1f5f9; }
+    .users-section { background: #1e293b; border-radius: 12px; padding: 20px; border: 1px solid #334155; }
+    .users-title { font-size: 16px; font-weight: 700; margin-bottom: 12px; color: #cbd5e1; }
+    .tag { display: inline-block; background: #0369a1; color: #e0f2fe; padding: 4px 10px; border-radius: 6px; font-size: 13px; margin: 4px; }
+    .footer { margin-top: 24px; text-align: center; color: #64748b; font-size: 13px; }
+  </style>
+  <script>
+    setTimeout(() => { window.location.reload(); }, 10000);
+  </script>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div class="title">🚀 Serveur RévisEdu Temps Réel v3.0</div>
+      <div class="badge-live">● En Ligne</div>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <div class="card-label">Élèves Connectés</div>
+        <div class="card-value" style="color: #38bdf8;">${clients.size}</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Messages Stockés</div>
+        <div class="card-value" style="color: #a78bfa;">${savedMessages.length + savedDirectMessages.length}</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Temps En Ligne</div>
+        <div class="card-value" style="color: #34d399; font-size: 22px;">${hours}h ${mins}m ${secs}s</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Mémoire RAM</div>
+        <div class="card-value" style="color: #fbbf24;">${memUsage} Mo</div>
+      </div>
+    </div>
+    <div class="users-section">
+      <div class="users-title">👤 Utilisateurs Actifs (${clients.size})</div>
+      <div>
+        ${onlinePeers.length > 0 ? onlinePeers.map((name) => `<span class="tag">${name}</span>`).join('') : '<span style="color:#64748b;">Aucun élève connecté pour le moment</span>'}
+      </div>
+    </div>
+    <div class="footer">
+      Actualisation automatique toutes les 10s • Auto Keep-Alive Actif • Zéro Crash Trap Actif
+    </div>
+  </div>
+</body>
+</html>`;
+
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(html);
+    return;
+  }
+
+  // 3. REST API /api/sync fallback
   if (url === '/api/sync') {
     if (req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -184,15 +304,12 @@ const httpServer = createServer((req, res) => {
           const clientData = JSON.parse(body || '{}');
           let changed = false;
 
-          // Merge accounts
           if (Array.isArray(clientData.accounts)) {
             for (const acc of clientData.accounts) {
               upsertAccount(acc);
               changed = true;
             }
           }
-
-          // Merge messages
           if (Array.isArray(clientData.messages)) {
             for (const m of clientData.messages) {
               if (m?.id && !savedMessages.some((existing) => existing.id === m.id)) {
@@ -202,7 +319,7 @@ const httpServer = createServer((req, res) => {
             }
           }
 
-          if (changed) persistStore();
+          if (changed) schedulePersistStore();
 
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify(getCurrentState()));
@@ -219,18 +336,21 @@ const httpServer = createServer((req, res) => {
   res.end('Not found');
 });
 
-const wss = new WebSocketServer({ server: httpServer });
+// -------------------------------------------------------------
+// WebSocket Engine with Anti-Spam & Peer Association
+// -------------------------------------------------------------
+const wss = new WebSocketServer({
+  server: httpServer,
+  maxPayload: 10 * 1024 * 1024 // 10MB maximum payload protection
+});
 
-// Active Heartbeat every 25s to keep connections alive and kill zombies
+// Active Heartbeat every 25s to keep connections alive and kill dead sockets
 const HEARTBEAT_INTERVAL = 25000;
 const heartbeatTimer = setInterval(() => {
   for (const ws of clients) {
     if (ws.isAlive === false) {
       console.log('[RévisEdu Realtime] Terminating inactive dead socket');
-      clients.delete(ws);
-      try {
-        ws.terminate();
-      } catch {}
+      handleClientDisconnection(ws);
       continue;
     }
 
@@ -238,13 +358,52 @@ const heartbeatTimer = setInterval(() => {
     try {
       ws.ping();
     } catch {
-      clients.delete(ws);
+      handleClientDisconnection(ws);
     }
   }
 }, HEARTBEAT_INTERVAL);
 
+function handleClientDisconnection(ws) {
+  if (!clients.has(ws)) return;
+  clients.delete(ws);
+
+  try {
+    ws.terminate();
+  } catch {}
+
+  // If user profile was attached, notify peers immediately so UI updates
+  if (ws.userProfile?.name) {
+    console.log(`[RévisEdu Realtime] Peer ${ws.userProfile.name} disconnected. Remaining: ${clients.size}`);
+    const key = ws.userProfile.name.toLowerCase().trim();
+    const acc = registeredAccounts.get(key);
+    if (acc) {
+      acc.status = 'offline';
+      acc.lastSeen = Date.now();
+      schedulePersistStore();
+    }
+
+    // Broadcast instant offline event to close any active call/game
+    const disconnectEvent = JSON.stringify({
+      type: 'CALL_END',
+      senderId: ws.userProfile.id || 'system',
+      data: {
+        reason: 'peer_disconnected',
+        disconnectedUserName: ws.userProfile.name
+      },
+      timestamp: Date.now()
+    });
+    broadcastToPeers(ws, disconnectEvent);
+  } else {
+    console.log(`[RévisEdu Realtime] Client disconnected. Peers remaining: ${clients.size}`);
+  }
+}
+
 wss.on('connection', (ws, req) => {
   ws.isAlive = true;
+  ws.messageCount = 0;
+  ws.lastMessageReset = Date.now();
+  ws.userProfile = null;
+
   clients.add(ws);
 
   ws.on('pong', () => {
@@ -270,10 +429,28 @@ wss.on('connection', (ws, req) => {
 
   ws.on('message', (messageRaw) => {
     ws.isAlive = true;
+
+    // Rate Limiting Protection (Max 120 messages per 5 seconds per socket)
+    const now = Date.now();
+    if (now - ws.lastMessageReset > 5000) {
+      ws.messageCount = 0;
+      ws.lastMessageReset = now;
+    }
+    ws.messageCount++;
+    if (ws.messageCount > 120) {
+      console.warn('[RévisEdu Realtime] Rate limit exceeded by client, dropping message');
+      return;
+    }
+
     try {
       const rawStr = messageRaw.toString();
       const payload = JSON.parse(rawStr);
       let shouldPersist = false;
+
+      // Attach profile to socket for disconnect cleanup
+      if (payload.data?.profile?.name) {
+        ws.userProfile = payload.data.profile;
+      }
 
       // Ping response from client app
       if (payload.type === 'PING') {
@@ -413,11 +590,13 @@ wss.on('connection', (ws, req) => {
       // Profiles
       if (payload.type === 'PROFILE_UPDATED' && payload.data?.profile) {
         upsertAccount(payload.data.profile);
+        ws.userProfile = payload.data.profile;
         shouldPersist = true;
       }
 
       if (payload.type === 'PRESENCE_PING' && payload.data?.profile) {
         upsertAccount(payload.data.profile);
+        ws.userProfile = payload.data.profile;
         shouldPersist = true;
       }
 
@@ -429,7 +608,7 @@ wss.on('connection', (ws, req) => {
       }
 
       if (shouldPersist) {
-        persistStore();
+        schedulePersistStore();
       }
 
       // Broadcast to other peers safely
@@ -440,29 +619,50 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', () => {
-    clients.delete(ws);
-    console.log(`[RévisEdu Realtime] Client disconnected. Peers remaining: ${clients.size}`);
+    handleClientDisconnection(ws);
   });
 
   ws.on('error', (err) => {
     console.warn('[RévisEdu Realtime] Client error:', err.message);
-    clients.delete(ws);
-    try {
-      ws.terminate();
-    } catch {}
+    handleClientDisconnection(ws);
   });
 });
 
+// -------------------------------------------------------------
+// Auto Keep-Alive for Render (Prevents Free Instance Sleeping)
+// -------------------------------------------------------------
+const KEEP_ALIVE_INTERVAL = 12 * 60 * 1000; // 12 minutes
+setInterval(() => {
+  try {
+    const targetUrl = new URL(`${RENDER_SERVICE_URL}/health`);
+    const reqModule = targetUrl.protocol === 'https:' ? httpsRequest : httpRequest;
+    const keepAliveReq = reqModule(targetUrl, { method: 'GET', timeout: 10000 }, (res) => {
+      console.log(`[RévisEdu Keep-Alive] Ping to ${targetUrl.href} succeeded (Status: ${res.statusCode})`);
+    });
+    keepAliveReq.on('error', (err) => {
+      console.warn(`[RévisEdu Keep-Alive] Ping failed:`, err.message);
+    });
+    keepAliveReq.end();
+  } catch (err) {
+    console.warn(`[RévisEdu Keep-Alive] Error scheduling keep-alive:`, err.message);
+  }
+}, KEEP_ALIVE_INTERVAL);
+
+// -------------------------------------------------------------
+// Start Server & Graceful Shutdown
+// -------------------------------------------------------------
 httpServer.listen(PORT, '0.0.0.0', () => {
-  console.log(`[RévisEdu Realtime v2.5] HTTP + WebSocket active on port ${PORT}`);
+  console.log(`[RévisEdu Realtime v3.0] HTTP + WebSocket active on port ${PORT}`);
+  console.log(`[RévisEdu Realtime] Dashboard: http://0.0.0.0:${PORT}/status`);
   console.log(`[RévisEdu Realtime] Health check: http://0.0.0.0:${PORT}/health`);
   console.log(`[RévisEdu Realtime] Sync endpoint: http://0.0.0.0:${PORT}/api/sync`);
+  console.log(`[RévisEdu Realtime] Auto Keep-Alive active every 12 mins for ${RENDER_SERVICE_URL}`);
 });
 
 const cleanupAndExit = () => {
   console.log('[RévisEdu Realtime] Gracefully shutting down...');
   clearInterval(heartbeatTimer);
-  persistStore();
+  flushStoreSync();
   for (const client of clients) {
     try {
       if (client.readyState === WebSocket.OPEN) client.close();
